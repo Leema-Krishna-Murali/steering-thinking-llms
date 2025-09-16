@@ -204,7 +204,7 @@ def get_label_positions(annotated_thinking, response_text, tokenizer):
     
     return label_positions
 
-def load_model_and_vectors(device=None, load_in_8bit=False, compute_features=True, normalize_features=True, model_name="deepseek-ai/DeepSeek-R1-Distill-Llama-8B", base_model_name=None):
+def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features=True, normalize_features=True, model_name="deepseek-ai/DeepSeek-R1-Distill-Llama-8B", base_model_name=None):
     """
     Load model, tokenizer and mean vectors. Optionally compute feature vectors.
     
@@ -216,18 +216,7 @@ def load_model_and_vectors(device=None, load_in_8bit=False, compute_features=Tru
         model_name (str): Name/path of the model to load
         base_model_name (str): Name/path of the base model to load
     """
-    # Auto-select device and dtype
-    try:
-        cuda_available = torch.cuda.is_available()
-    except Exception:
-        cuda_available = False
-
-    if device is None:
-        device = "cuda:0" if cuda_available else "cpu"
-
-    dtype = torch.bfloat16 if device != "cpu" else torch.float32
-
-    model = LanguageModel(model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=dtype)
+    model = LanguageModel(model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=torch.bfloat16)
     
     model.generation_config.temperature=None
     model.generation_config.top_p=None
@@ -240,7 +229,7 @@ def load_model_and_vectors(device=None, load_in_8bit=False, compute_features=Tru
     tokenizer.padding_side = "left"
 
     if base_model_name is not None:
-        base_model = LanguageModel(base_model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=dtype)
+        base_model = LanguageModel(base_model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=torch.bfloat16)
     
         base_model.generation_config.temperature=None
         base_model.generation_config.top_p=None
