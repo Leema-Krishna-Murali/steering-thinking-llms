@@ -33,6 +33,12 @@ parser.add_argument("--seed", type=int, default=42,
                     help="Random seed")
 parser.add_argument("--batch_size", type=int, default=1,
                     help="Batch size for processing messages")
+parser.add_argument("--use_local_annotation", action="store_true", default=False,
+                    help="Use a local open model for annotation instead of API keys")
+parser.add_argument("--annotation_model", type=str, default=None,
+                    help="Optional: model to use for local annotation (defaults to --model)")
+parser.add_argument("--annotation_max_tokens", type=int, default=512,
+                    help="Max tokens for local annotation outputs")
 args, _ = parser.parse_known_args()
 
 # python train_vectors.py --model deepseek-ai/DeepSeek-R1-Distill-Llama-8B --n_samples 500 --max_tokens 1000 --batch_size 4 --save_every 1 --load_from_json --update_annotation
@@ -46,6 +52,45 @@ def extract_thinking_process(response):
     except ValueError:
         think_end = len(response)
     return response[think_start:think_end].strip()
+# Local annotation helper (no API keys). Generates label markup using a local model.
+def annotate_with_local_model(thinking_list, ann_model, ann_tokenizer, max_new_tokens=512):
+    annotated = []
+    import torch as _torch
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+
+    prompt_header = (
+        "Please split the following reasoning chain of an LLM into annotated parts using labels and the following format [\"label\"]...[\"end-section\"]. "
+        "A sentence should be split into multiple parts if it incorporates multiple behaviours indicated by the labels.\n\n"
+        "Available labels:\n"
+        "0. initializing -> The model is rephrasing the given task and states initial thoughts.\n"
+        "1. deduction -> The model is performing a deduction step based on its current approach and assumptions.\n"
+        "2. adding-knowledge -> The model is enriching the current approach with recalled facts.\n"
+        "3. example-testing -> The model generates examples to test its current approach.\n"
+        "4. uncertainty-estimation -> The model is stating its own uncertainty.\n"
+        "5. backtracking -> The model decides to change its approach.\n\n"
+        "The reasoning chain to analyze:\n"
+    )
+
+    for thinking in thinking_list:
+        prompt = f"{prompt_header}{thinking}\n\nAnswer only with the annotated text. Only use the labels outlined above. If there is a tail that has no annotation leave it out."
+        input_ids = ann_tokenizer.apply_chat_template([
+            {"role": "user", "content": prompt}
+        ], add_generation_prompt=True, return_tensors="pt").to(device)
+
+        with ann_model.generate(
+            {
+                "input_ids": input_ids,
+                "attention_mask": (input_ids != ann_tokenizer.pad_token_id).long()
+            },
+            max_new_tokens=max_new_tokens,
+            pad_token_id=ann_tokenizer.pad_token_id
+        ) as tracer:
+            outputs = ann_model.generator.output.save()
+
+        text = ann_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        annotated.append(text)
+
+    return annotated
 
 def update_mean_vectors(mean_vectors, layer_outputs, label_positions, index):
     """Update mean vectors for overall and individual labels"""
@@ -135,7 +180,26 @@ for batch_idx in tqdm(range(num_batches), desc="Processing responses"):
     batch_indices = list(range(start_idx, end_idx))
     
     # Generate annotations
-    annotated_responses = utils.process_batch_annotations(thinking_processes)
+    if args.use_local_annotation:
+        # Use local model for annotation (default to the same --model unless overridden)
+        ann_model_name = args.annotation_model or model_name
+        print(f"Loading local annotation model {ann_model_name}...")
+        ann_model, ann_tokenizer, _ = utils.load_model_and_vectors(
+            compute_features=False,
+            model_name=ann_model_name,
+            load_in_8bit=args.load_in_8bit
+        )
+        annotated_responses = annotate_with_local_model(
+            thinking_processes,
+            ann_model,
+            ann_tokenizer,
+            max_new_tokens=args.annotation_max_tokens,
+        )
+        del ann_model
+        torch.cuda.empty_cache()
+        gc.collect()
+    else:
+        annotated_responses = utils.process_batch_annotations(thinking_processes)
     
     # Update annotation fields in the JSON
     for i, (response_data, annotated) in enumerate(zip(batch_responses, annotated_responses)):
