@@ -5,7 +5,7 @@ dotenv.load_dotenv("../.env")
 from transformers import AutoTokenizer
 import torch
 import os
-from messages import messages, eval_messages
+from messages import messages, eval_messages, crescendo_messages
 from tqdm import tqdm
 import random
 import json
@@ -31,6 +31,8 @@ parser.add_argument("--batch_size", type=int, default=64,
                     help="Batch size for processing messages")
 parser.add_argument("--generate_eval", action="store_true", default=False,
                     help="Generate responses for eval_messages instead of regular messages")
+parser.add_argument("--dataset", type=str, choices=["default", "eval", "crescendo"], default="default",
+                    help="Which dataset to generate: default | eval | crescendo")
 args, _ = parser.parse_known_args()
 
 def get_batched_message_ids(tokenizer, messages_list):
@@ -101,10 +103,19 @@ if __name__ == "__main__":
     responses_data = []
     random.seed(args.seed)
 
-    # Choose message set based on --generate_eval flag
-    selected_messages = eval_messages if args.generate_eval else messages
+    # Choose message set based on --dataset flag (backwards-compatible with --generate_eval)
+    dataset = args.dataset
+    if args.generate_eval:
+        dataset = "eval"
+
+    if dataset == "eval":
+        selected_messages = eval_messages
+    elif dataset == "crescendo":
+        selected_messages = crescendo_messages
+    else:
+        selected_messages = messages
     
-    print(f"Processing {args.n_samples} {'evaluation' if args.generate_eval else ''} messages to generate responses")
+    print(f"Processing {args.n_samples} messages from dataset: {dataset}")
     random.shuffle(selected_messages)
     selected_messages = selected_messages[:args.n_samples]
     num_batches = math.ceil(len(selected_messages) / args.batch_size)
