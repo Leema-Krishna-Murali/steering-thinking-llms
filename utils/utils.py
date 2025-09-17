@@ -204,7 +204,7 @@ def get_label_positions(annotated_thinking, response_text, tokenizer):
     
     return label_positions
 
-def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features=True, normalize_features=True, model_name="deepseek-ai/DeepSeek-R1-Distill-Llama-8B", base_model_name=None):
+def load_model_and_vectors(device=None, load_in_8bit=False, compute_features=True, normalize_features=True, model_name="deepseek-ai/DeepSeek-R1-Distill-Llama-8B", base_model_name=None):
     """
     Load model, tokenizer and mean vectors. Optionally compute feature vectors.
     
@@ -216,7 +216,18 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
         model_name (str): Name/path of the model to load
         base_model_name (str): Name/path of the base model to load
     """
-    model = LanguageModel(model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=torch.bfloat16)
+    # Auto-select device and dtype
+    try:
+        cuda_available = torch.cuda.is_available()
+    except Exception:
+        cuda_available = False
+
+    if device is None:
+        device = "cuda:0" if cuda_available else "cpu"
+
+    dtype = torch.bfloat16 if device != "cpu" else torch.float32
+
+    model = LanguageModel(model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=dtype)
     
     model.generation_config.temperature=None
     model.generation_config.top_p=None
@@ -229,7 +240,7 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
     tokenizer.padding_side = "left"
 
     if base_model_name is not None:
-        base_model = LanguageModel(base_model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=torch.bfloat16)
+        base_model = LanguageModel(base_model_name, dispatch=True, load_in_8bit=load_in_8bit, device_map=device, torch_dtype=dtype)
     
         base_model.generation_config.temperature=None
         base_model.generation_config.top_p=None
@@ -255,19 +266,33 @@ def load_model_and_vectors(device="cuda:0", load_in_8bit=False, compute_features
         mean_vectors_dict = torch.load(vector_path)
 
         if compute_features:
-            # Compute feature vectors by subtracting overall mean
+            # Compute feature vectors dynamically for all labels present
             feature_vectors = {}
-            feature_vectors["overall"] = mean_vectors_dict["overall"]['mean']
-            
-            for label in ["initializing", "deduction", "adding-knowledge", "example-testing", "uncertainty-estimation", "backtracking"]:
+            overall_mean = mean_vectors_dict.get("overall", {}).get('mean', None)
+            if overall_mean is None:
+                print(f"No 'overall' vectors found in {vector_path}")
+                overall_mean = torch.zeros(model.config.num_hidden_layers, model.config.hidden_size)
 
-                if label != 'overall':
-                    feature_vectors[label] = mean_vectors_dict[label]['mean'] - mean_vectors_dict["overall"]['mean']
+            feature_vectors["overall"] = overall_mean
 
-                if normalize_features:
-                    for label in feature_vectors:
-                        for layer in range(model.config.num_hidden_layers):
-                            feature_vectors[label][layer] = feature_vectors[label][layer] * (feature_vectors["overall"][layer].norm() / feature_vectors[label][layer].norm())
+            for label_name, stats in mean_vectors_dict.items():
+                if label_name == 'overall':
+                    continue
+                if 'mean' not in stats:
+                    continue
+                feature_vectors[label_name] = stats['mean'] - overall_mean
+
+            if normalize_features:
+                for lbl, vec in list(feature_vectors.items()):
+                    if lbl == 'overall':
+                        continue
+                    for layer in range(model.config.num_hidden_layers):
+                        num = feature_vectors['overall'][layer].norm()
+                        den = vec[layer].norm()
+                        if den is not None and den.item() != 0:
+                            vec[layer] = vec[layer] * (num / den)
+                        else:
+                            vec[layer] = vec[layer]
     else:
         print(f"No mean vectors found for {model_name}")
         mean_vectors_dict = {}
@@ -313,14 +338,16 @@ def custom_generate_steering(model, tokenizer, input_ids, max_new_tokens, label,
             pos_layers = steering_config[label]["pos_layers"]
             neg_layers = steering_config[label]["neg_layers"]
             coefficient = steering_config[label]["pos_coefficient"] if steer_positive else steering_config[label]["neg_coefficient"]
-     
+            
+            device = input_ids.device
+            dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
 
             if steer_positive:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
+                feature_vector = feature_vectors[label][vector_layer].to(device).to(dtype)
                 for layer_idx in pos_layers:         
                     model.model.layers[layer_idx].output[0][:, :] += coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
             else:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
+                feature_vector = feature_vectors[label][vector_layer].to(device).to(dtype)
                 for layer_idx in neg_layers:         
                     model.model.layers[layer_idx].output[0][:, :] -= coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
         
@@ -330,7 +357,7 @@ def custom_generate_steering(model, tokenizer, input_ids, max_new_tokens, label,
 
 
 def process_batch_annotations(thinking_processes):
-    """Annotate a batch of reasoning chains using the 7-category reasoning framework."""
+    """Annotate a batch of reasoning chains including safety/refusal labels."""
     annotated_responses = []
     for thinking in thinking_processes:
         annotated_response = chat(f"""
@@ -343,6 +370,8 @@ def process_batch_annotations(thinking_processes):
         3. example-testing -> The model generates examples to test its current approach.
         4. uncertainty-estimation -> The model is stating its own uncertainty.
         5. backtracking -> The model decides to change its approach.
+        6. policy-check -> The model performs a safety/policy self-check or alignment consideration.
+        7. refusal -> The model issues a safety-grounded refusal and/or redirects to safe alternatives.
 
         The reasoning chain to analyze:
         {thinking}
@@ -405,17 +434,23 @@ steering_config = {
         "uncertainty-estimation": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
         "example-testing": {"vector_layer": 15, "pos_layers": [15], "neg_layers": [15], "pos_coefficient": 1, "neg_coefficient": 1},
         "adding-knowledge": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
+        "policy-check": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
+        "refusal": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
     },
     "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": {
         "backtracking": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
         "uncertainty-estimation": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
         "example-testing": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
         "adding-knowledge": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
+        "policy-check": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
+        "refusal": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
     },
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": {
         "backtracking": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
         "uncertainty-estimation": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
         "example-testing": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
         "adding-knowledge": {"vector_layer": 24, "pos_layers": [24], "neg_layers": [24], "pos_coefficient": 1, "neg_coefficient": 1},
+        "policy-check": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
+        "refusal": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
     }
 }
