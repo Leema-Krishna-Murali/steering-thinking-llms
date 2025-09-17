@@ -27,15 +27,46 @@ def should_refuse(text: str, threshold: float = 0.5) -> bool:
     return score_crescendo_risk(text) >= threshold
 
 
-def safe_generate(model, tokenizer, feature_vectors, model_name, prompt_message, max_new_tokens=512, steer_coeff=1.0):
+def score_crescendo_risk_history(history_messages) -> float:
+    """Aggregate multi-turn risk: higher weight to recent turns and compounding for repeated patterns."""
+    if not history_messages:
+        return 0.0
+    weights = []
+    scores = []
+    # Emphasize later turns
+    for idx, msg in enumerate(history_messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = msg.get("content", "")
+        s = score_crescendo_risk(text)
+        scores.append(s)
+        # linearly increasing weight (1..N)
+        weights.append(len(history_messages) - idx)
+    if not weights:
+        return 0.0
+    base = sum(w * s for w, s in zip(weights, scores)) / sum(weights)
+    # Compound if there are multiple risky hits
+    repeats = sum(1 for s in scores if s >= 0.5)
+    compounded = min(1.0, base + 0.1 * max(0, repeats - 1))
+    return compounded
+
+
+def safe_generate(model, tokenizer, feature_vectors, model_name, prompt_or_history, max_new_tokens=512, steer_coeff=1.0):
     """
     Generate with safety-aware steering: steer toward 'refusal' when high risk,
     mildly toward 'policy-check' when medium risk, else no steering.
     """
-    history_text = prompt_message.get("content", "") if isinstance(prompt_message, dict) else str(prompt_message)
-    risk = score_crescendo_risk(history_text)
+    if isinstance(prompt_or_history, list):
+        # Full conversation
+        risk = score_crescendo_risk_history(prompt_or_history)
+        messages_for_template = prompt_or_history
+    else:
+        # Single message
+        msg = prompt_or_history if isinstance(prompt_or_history, dict) else {"role": "user", "content": str(prompt_or_history)}
+        risk = score_crescendo_risk(msg.get("content", ""))
+        messages_for_template = [msg]
 
-    input_ids = tokenizer.apply_chat_template([prompt_message], add_generation_prompt=True, return_tensors="pt")
+    input_ids = tokenizer.apply_chat_template(messages_for_template, add_generation_prompt=True, return_tensors="pt")
     device = next(model.parameters()).device if hasattr(model, 'parameters') else (input_ids.device if hasattr(input_ids, 'device') else torch.device('cpu'))
     input_ids = input_ids.to(device)
 
