@@ -1,17 +1,20 @@
 import argparse
+import copy
+import gc
+import json
+import math
+import os
+import random
+
 import dotenv
+import torch
+from tqdm import tqdm
+
 dotenv.load_dotenv("../.env")
 
-from transformers import AutoTokenizer
-import torch
-import os
-from messages import messages, eval_messages
-from tqdm import tqdm
-import random
-import json
+from messages import eval_messages, messages
 import utils
-import math
-import gc
+from utils.message_utils import load_message_bank
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Generate responses from models without steering vectors")
@@ -31,17 +34,39 @@ parser.add_argument("--batch_size", type=int, default=64,
                     help="Batch size for processing messages")
 parser.add_argument("--generate_eval", action="store_true", default=False,
                     help="Generate responses for eval_messages instead of regular messages")
+parser.add_argument("--messages_path", type=str, default=None,
+                    help="Optional path to JSON/JSONL messages for training generation")
+parser.add_argument("--eval_messages_path", type=str, default=None,
+                    help="Optional path to JSON/JSONL messages for eval generation")
 args, _ = parser.parse_known_args()
 
-def get_batched_message_ids(tokenizer, messages_list):
-    max_token_length = max([len(tokenizer.apply_chat_template([msg], add_generation_prompt=True, return_tensors="pt")[0]) for msg in messages_list])
-    input_ids = torch.cat([tokenizer.apply_chat_template([msg], add_generation_prompt=True, padding="max_length", max_length=max_token_length, return_tensors="pt").to("cuda") for msg in messages_list])
-    
+def get_batched_message_ids(tokenizer, conversations):
+    max_token_length = max(
+        len(
+            tokenizer.apply_chat_template(
+                conversation,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            )[0]
+        )
+        for conversation in conversations
+    )
+    input_ids = torch.cat([
+        tokenizer.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            padding="max_length",
+            max_length=max_token_length,
+            return_tensors="pt"
+        ).to("cuda")
+        for conversation in conversations
+    ])
     return input_ids
 
 def process_model_output_batch(messages_batch, tokenizer, model):
     """Get model output for a batch of messages without collecting activations"""
-    tokenized_messages = get_batched_message_ids(tokenizer, messages_batch)
+    conversations = [entry["conversation"] for entry in messages_batch]
+    tokenized_messages = get_batched_message_ids(tokenizer, conversations)
     
     with model.generate(
         {
@@ -57,10 +82,12 @@ def process_model_output_batch(messages_batch, tokenizer, model):
 
 def extract_thinking_process(response):
     """Extract thinking process from response"""
+    if "<think>" not in response:
+        return ""
+
     think_start = response.index("<think>") + len("<think>")
-    try:
-        think_end = response.index("</think>")
-    except ValueError:
+    think_end = response.find("</think>", think_start)
+    if think_end == -1:
         think_end = len(response)
     return response[think_start:think_end].strip()
 
@@ -68,19 +95,25 @@ def extract_thinking_process(response):
 def process_message_batch(messages_batch, tokenizer, model):
     """Process a batch of messages and return response data"""
     outputs = process_model_output_batch(messages_batch, tokenizer, model)
-    
+
     responses = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
     thinking_processes = [extract_thinking_process(response) for response in responses]
-    
+
     batch_data = []
-    for message, response, thinking in zip(messages_batch, responses, thinking_processes):
+    for message_entry, response, thinking in zip(messages_batch, responses, thinking_processes):
         batch_data.append({
-            "original_message": message,
+            "original_message": copy.deepcopy(message_entry["conversation"]),
+            "conversation": copy.deepcopy(message_entry["conversation"]),
+            "meta": copy.deepcopy(message_entry.get("meta", {})),
+            "reference_answer": message_entry.get("reference_answer"),
+            "dataset_id": message_entry.get("id"),
+            "dataset_name": message_entry.get("dataset_name"),
+            "source": message_entry.get("source"),
             "full_response": response,
             "thinking_process": thinking,
             "annotated_thinking": ""  # Empty string for annotated_thinking
         })
-    
+
     return batch_data
 
 # Main execution
@@ -102,11 +135,16 @@ if __name__ == "__main__":
     random.seed(args.seed)
 
     # Choose message set based on --generate_eval flag
-    selected_messages = eval_messages if args.generate_eval else messages
-    
+    message_override = args.eval_messages_path if args.generate_eval else args.messages_path
+    default_messages = eval_messages if args.generate_eval else messages
+    message_bank = load_message_bank(
+        default_messages=default_messages,
+        override_path=message_override,
+    )
+
     print(f"Processing {args.n_samples} {'evaluation' if args.generate_eval else ''} messages to generate responses")
-    random.shuffle(selected_messages)
-    selected_messages = selected_messages[:args.n_samples]
+    random.shuffle(message_bank)
+    selected_messages = message_bank[:args.n_samples]
     num_batches = math.ceil(len(selected_messages) / args.batch_size)
     
     for batch_idx in tqdm(range(num_batches), desc="Processing message batches"):

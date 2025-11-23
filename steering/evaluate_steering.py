@@ -4,18 +4,15 @@ import dotenv
 dotenv.load_dotenv("../.env")
 
 import torch
-import re
 import json
 import random
 from messages import eval_messages
-import messages
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
-from collections import defaultdict
-import gc
 import os
 import utils
+from utils.message_utils import load_message_bank
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Evaluate steering effects on model reasoning")
@@ -31,6 +28,8 @@ parser.add_argument("--seed", type=int, default=42,
                     help="Random seed")
 parser.add_argument("--only_viz", action="store_true",
                     help="Only visualize the results")
+parser.add_argument("--messages_path", type=str, default=None,
+                    help="Optional JSON/JSONL path with evaluation prompts")
 args = parser.parse_args()
 
 # %%
@@ -60,8 +59,12 @@ def get_label_counts(thinking_process, original_response, labels):
             
     return label_fractions, annotated_response
 
-def generate_and_analyze(model, tokenizer, message, feature_vectors, model_steering_config, label, labels, steer_mode="none"):
-    input_ids = tokenizer.apply_chat_template([message], add_generation_prompt=True, return_tensors="pt").to("cuda")
+def generate_and_analyze(model, tokenizer, message_entry, feature_vectors, model_steering_config, label, labels, steer_mode="none"):
+    input_ids = tokenizer.apply_chat_template(
+        message_entry["conversation"],
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
     
     steer_positive = True if steer_mode == "positive" else False
 
@@ -79,12 +82,14 @@ def generate_and_analyze(model, tokenizer, message, feature_vectors, model_steer
     response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     
     # Extract thinking process
-    think_start = response.index("<think>") + len("<think>")
-    try:
-        think_end = response.index("</think>")
-    except ValueError:
-        think_end = len(response)
-    thinking_process = response[think_start:think_end].strip()
+    if "<think>" in response:
+        think_start = response.index("<think>") + len("<think>")
+        think_end = response.find("</think>", think_start)
+        if think_end == -1:
+            think_end = len(response)
+        thinking_process = response[think_start:think_end].strip()
+    else:
+        thinking_process = ""
     
     label_fractions, annotated_response = get_label_counts(thinking_process, response, labels)
     
@@ -92,7 +97,10 @@ def generate_and_analyze(model, tokenizer, message, feature_vectors, model_steer
         "response": response,
         "thinking_process": thinking_process,
         "label_fractions": label_fractions,
-        "annotated_response": annotated_response
+        "annotated_response": annotated_response,
+        "meta": message_entry.get("meta"),
+        "dataset_id": message_entry.get("id"),
+        "dataset_name": message_entry.get("dataset_name"),
     }
 
 def plot_label_statistics(results, model_name, ax=None, show_legend=True, show_ylabel=True, xtick_rotation=0):
@@ -223,7 +231,13 @@ if not only_viz:
 
 # %% Randomly sample evaluation examples
 if not only_viz:
-    eval_indices = random.sample(range(len(eval_messages)), n_examples)
+    message_bank = load_message_bank(
+        default_messages=eval_messages,
+        override_path=args.messages_path,
+    )
+    if not message_bank:
+        raise ValueError("No evaluation prompts available.")
+    eval_subset = random.sample(message_bank, min(n_examples, len(message_bank)))
 
     # Store results
     labels = list(list(utils.steering_config.values())[0].keys())
@@ -231,14 +245,13 @@ if not only_viz:
 
     # Evaluate each label
     for label in labels:
-        for idx in tqdm(eval_indices, desc=f"Processing examples for {label}"):
-            message = eval_messages[idx]
+        for message_entry in tqdm(eval_subset, desc=f"Processing examples for {label}"):
 
             # Only proceed if original version has >5% of the target label
             example_results = {
-                "original": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "none"),
-                "positive": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "positive"),
-                "negative": generate_and_analyze(model, tokenizer, message, feature_vectors, utils.steering_config[model_name], label, labels, "negative")
+                "original": generate_and_analyze(model, tokenizer, message_entry, feature_vectors, utils.steering_config[model_name], label, labels, "none"),
+                "positive": generate_and_analyze(model, tokenizer, message_entry, feature_vectors, utils.steering_config[model_name], label, labels, "positive"),
+                "negative": generate_and_analyze(model, tokenizer, message_entry, feature_vectors, utils.steering_config[model_name], label, labels, "negative")
             }
             
             results[label].append(example_results)
